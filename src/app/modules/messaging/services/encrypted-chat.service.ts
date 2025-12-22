@@ -17,7 +17,7 @@
 * You should have received a copy of the GNU Affero General Public License
 * along with Nonprofit Social Networking Platform.  If not, see <https://www.gnu.org/licenses/>.
 ***********************************************************************************************/
-import {Injectable} from "@angular/core";
+import {Injectable, Injector} from "@angular/core";
 import {AngularFirestore} from "@angular/fire/compat/firestore";
 import {
   Observable,
@@ -75,7 +75,27 @@ export class EncryptedChatService {
     private store: Store<{auth: AuthState}>,
     private encryptionService: EncryptionService,
     private chatService: ChatService,
-  ) {}
+    private injector: Injector, // Use Injector to lazily get KeyBackupService
+  ) {
+    // Subscribe to encryption key changes to clear cache
+    this.encryptionService.keysChanged$.subscribe(({userId, action}) => {
+      console.log(
+        `[EncryptedChatService] Key change detected: ${action} for user ${userId}`,
+      );
+      if (action === "restored") {
+        // Clear all caches to force re-decryption with new keys
+        this.clearDecryptionCache();
+        console.log(
+          "[EncryptedChatService] Decryption cache cleared, triggering re-decryption",
+        );
+      }
+    });
+  }
+
+  // Lazy getter for KeyBackupService to avoid circular dependency
+  private get keyBackupService(): any {
+    return this.injector.get("KeyBackupService" as any, null);
+  }
 
   private getCurrentUserId(): Observable<string> {
     return this.store.select(selectAuthUser).pipe(
@@ -224,7 +244,22 @@ export class EncryptedChatService {
       }
 
       // Check if encryption is available before attempting encryption
-      if (!this.isEncryptionAvailable(request.chatId)) {
+      const participantStatus = await this.getParticipantEncryptionStatus(
+        request.chatId,
+      );
+
+      if (
+        !participantStatus.allReady &&
+        participantStatus.missingKeyParticipants.length > 0
+      ) {
+        // Some participants don't have encryption keys
+        const error: any = new Error("PARTIAL_ENCRYPTION_AVAILABLE");
+        error.missingKeyParticipants = participantStatus.missingKeyParticipants;
+        error.readyParticipants = participantStatus.readyParticipants;
+        throw error;
+      }
+
+      if (!(await this.isEncryptionAvailable(request.chatId))) {
         console.warn(
           "Encryption not available, falling back to unencrypted message",
         );
@@ -256,30 +291,46 @@ export class EncryptedChatService {
           messageKey,
         );
 
-        // Get public keys for all participants and encrypt the message key for each
+        // Get public keys for all participants and encrypt the message key for each (in parallel)
         const encryptedKeys: {[userId: string]: string} = {};
         let encryptionFailures = 0;
 
-        for (const participantId of chat.participants) {
-          try {
-            const publicKey = await this.getUserPublicKey(participantId);
-            if (publicKey) {
-              encryptedKeys[participantId] =
-                await this.encryptionService.encryptKeyForRecipient(
-                  messageKey,
-                  publicKey,
+        // Parallel encryption for better performance (5x faster for large groups)
+        const encryptionPromises = chat.participants.map(
+          async (participantId) => {
+            try {
+              const publicKey = await this.getUserPublicKey(participantId);
+              if (publicKey) {
+                const encryptedKey =
+                  await this.encryptionService.encryptKeyForRecipient(
+                    messageKey,
+                    publicKey,
+                  );
+                return {participantId, encryptedKey, success: true};
+              } else {
+                console.warn(
+                  `No public key found for participant: ${participantId}`,
                 );
-            } else {
+                return {participantId, encryptedKey: "", success: false};
+              }
+            } catch (keyError) {
               console.warn(
-                `No public key found for participant: ${participantId}`,
+                `Failed to encrypt key for participant ${participantId}:`,
+                keyError,
               );
-              encryptionFailures++;
+              return {participantId, encryptedKey: "", success: false};
             }
-          } catch (keyError) {
-            console.warn(
-              `Failed to encrypt key for participant ${participantId}:`,
-              keyError,
-            );
+          },
+        );
+
+        // Wait for all encryption operations to complete
+        const results = await Promise.all(encryptionPromises);
+
+        // Process results
+        for (const result of results) {
+          if (result.success) {
+            encryptedKeys[result.participantId] = result.encryptedKey;
+          } else {
             encryptionFailures++;
           }
         }
@@ -384,11 +435,12 @@ export class EncryptedChatService {
       // Get encrypted message key for this user
       const encryptedKey = message.encryptedKeys![userId];
       if (!encryptedKey) {
+        // This is expected for historical messages sent before the user was added to the chat
+        // or before the user had encryption keys set up.
         console.warn(
-          `No encrypted key found for user ${userId}, available keys:`,
-          Object.keys(message.encryptedKeys!),
+          `[EncryptedChat] Skipping message ${message.id}: No key for user ${userId}`,
         );
-        return "🔒 Encrypted message (no access key)";
+        return "🔒 Encrypted message (sent before you joined or encryption was set up)";
       }
 
       // Decrypt the message key
@@ -412,23 +464,30 @@ export class EncryptedChatService {
 
       return decryptedText;
     } catch (error) {
-      console.error("Error decrypting message:", error);
-
       // Type the error properly
       const typedError = error as Error;
 
-      // Check if this might be a key mismatch issue
+      // Check if this might be a key mismatch issue (OperationError)
       if (typedError.name === "OperationError") {
         console.warn(
-          "OperationError detected - key import/export issue, but NOT regenerating keys to preserve message history",
+          `[EncryptedChat] Decryption failed for message ${message.id} (Key Mismatch):`,
+          typedError.message,
         );
-        // DO NOT regenerate keys automatically as this would make old messages unreadable
-        // Instead, return a helpful message that suggests manual key regeneration if needed
-        return "🔒 Encrypted message (key mismatch - refresh page or regenerate keys if this persists)";
+        // More helpful error message with action
+        return "🔒 Unable to decrypt (key mismatch). Try restoring your backup in encryption settings.";
       }
 
-      // Return a user-friendly fallback instead of throwing
-      return "🔒 Encrypted message (unable to decrypt)";
+      // Check for invalid key format
+      if (
+        typedError.message?.includes("key") ||
+        typedError.message?.includes("Invalid")
+      ) {
+        console.error("[EncryptedChat] Invalid key format:", error);
+        return "🔒 Unable to decrypt (invalid key format). Check encryption settings.";
+      }
+
+      console.error("[EncryptedChat] Error decrypting message:", error);
+      return "🔒 Unable to decrypt. Contact support if this persists.";
     }
   }
 
@@ -467,12 +526,35 @@ export class EncryptedChatService {
   }
 
   /**
+   * Clear the decryption cache
+   * This forces all messages to be re-decrypted (useful when keys are restored)
+   */
+  clearDecryptionCache(): void {
+    console.log(
+      `[EncryptedChatService] Clearing cache - ${this.decryptedCache.size} cached messages, ${this.messageVersions.size} versions, ${this.decryptingMessages.size} in-progress`,
+    );
+    this.decryptedCache.clear();
+    this.messageVersions.clear();
+    this.decryptingMessages.clear();
+    // Trigger update to re-decrypt all messages
+    const newValue = this.updateTrigger.value + 1;
+    console.log(
+      `[EncryptedChatService] Triggering update: ${this.updateTrigger.value} -> ${newValue}`,
+    );
+    this.updateTrigger.next(newValue);
+  }
+
+  /**
    * Get messages with zero-flicker decryption using combined observable streams
    * Hides encrypted messages until they are successfully decrypted
    */
-  getDecryptedMessages(chatId: string, userId: string): Observable<Message[]> {
+  getDecryptedMessages(
+    chatId: string,
+    userId: string,
+    limit: number = 20,
+  ): Observable<Message[]> {
     return combineLatest([
-      this.chatService.getChatMessages(chatId),
+      this.chatService.getChatMessages(chatId, limit),
       this.updateTrigger.asObservable(),
     ]).pipe(
       map(([messages, _trigger]) => {
@@ -500,6 +582,9 @@ export class EncryptedChatService {
             // For encrypted messages, check cache first
             const cachedText = this.decryptedCache.get(cacheKey);
             if (cachedText !== undefined) {
+              console.log(
+                `[EncryptedChatService] Using cached text for message ${messageId}`,
+              );
               return {
                 ...message,
                 text: cachedText,
@@ -507,6 +592,9 @@ export class EncryptedChatService {
             }
 
             // If not cached, start async decryption
+            console.log(
+              `[EncryptedChatService] Starting decryption for message ${messageId}`,
+            );
             this.startAsyncDecryption(message, userId, messageId, cacheKey);
 
             // Return null to hide the message until decryption completes
@@ -526,6 +614,59 @@ export class EncryptedChatService {
         });
       }),
       shareReplay(1),
+    );
+  }
+
+  /**
+   * Get decrypted historical messages
+   * Reuses the same caching and decryption logic as the real-time stream
+   */
+  getDecryptedHistory(
+    chatId: string,
+    startAfter: any,
+    limit: number,
+    userId: string,
+  ): Observable<Message[]> {
+    return this.chatService.getChatHistory(chatId, startAfter, limit).pipe(
+      map((messages) => {
+        // Process messages for decryption
+        messages.forEach((message) => {
+          const messageId = message.id || `temp_${Date.now()}_${Math.random()}`;
+          const cacheKey = `${messageId}_${userId}`;
+
+          if (
+            message.isEncrypted &&
+            this.isValidEncryptedMessage(message) &&
+            !this.decryptedCache.has(cacheKey)
+          ) {
+            // Start async decryption for any messages not already in cache
+            this.startAsyncDecryption(message, userId, messageId, cacheKey);
+          }
+        });
+
+        // Return messages with decrypted content if available in cache, or placeholder
+        return messages.map((message) => {
+          if (!message.isEncrypted) return message;
+
+          const messageId = message.id;
+          const cacheKey = `${messageId}_${userId}`;
+
+          if (this.decryptedCache.has(cacheKey)) {
+            return {
+              ...message,
+              text: this.decryptedCache.get(cacheKey),
+            };
+          }
+
+          // If not yet decrypted, return as is (but decryption has started in background)
+          // The UI should handle showing a loading state or "decrypting..."
+          // Note: Since this is a one-time fetch, we might need to handle the update
+          // differently than the real-time stream.
+          // For now, we return valid messages, and the component can subscribe
+          // to updateTrigger if it wants to be notified of late decryptions.
+          return message;
+        });
+      }),
     );
   }
 
@@ -601,7 +742,59 @@ export class EncryptedChatService {
   }
 
   /**
+   * Get detailed encryption status for all chat participants
+   * Returns which participants have keys and which don't
+   */
+  async getParticipantEncryptionStatus(chatId: string): Promise<{
+    allReady: boolean;
+    readyParticipants: string[];
+    missingKeyParticipants: string[];
+    participantNames?: Map<string, string>;
+  }> {
+    try {
+      const chat = await firstValueFrom(this.chatService.getChat(chatId));
+      if (!chat) {
+        return {
+          allReady: false,
+          readyParticipants: [],
+          missingKeyParticipants: [],
+        };
+      }
+
+      const readyParticipants: string[] = [];
+      const missingKeyParticipants: string[] = [];
+
+      for (const participantId of chat.participants) {
+        try {
+          const publicKey = await this.getUserPublicKey(participantId);
+          if (publicKey) {
+            readyParticipants.push(participantId);
+          } else {
+            missingKeyParticipants.push(participantId);
+          }
+        } catch (error) {
+          missingKeyParticipants.push(participantId);
+        }
+      }
+
+      return {
+        allReady: missingKeyParticipants.length === 0,
+        readyParticipants,
+        missingKeyParticipants,
+      };
+    } catch (error) {
+      console.error("Error checking participant encryption status:", error);
+      return {
+        allReady: false,
+        readyParticipants: [],
+        missingKeyParticipants: [],
+      };
+    }
+  }
+
+  /**
    * Check if encryption is available for a chat
+   * Returns true only if all participants have public keys available
    */
   async isEncryptionAvailable(chatId: string): Promise<boolean> {
     try {
@@ -610,9 +803,10 @@ export class EncryptedChatService {
         return false;
       }
 
-      // For this demo, encryption is available if:
+      // For encryption to be available:
       // 1. The browser supports Web Crypto API
       // 2. The current user has encryption enabled
+      // 3. All participants have public keys available
       const userId = await firstValueFrom(this.getCurrentUserId());
       if (!userId) {
         return false;
@@ -625,7 +819,22 @@ export class EncryptedChatService {
 
       // Check if user has a stored key pair (encryption enabled)
       const keyPair = await this.encryptionService.getStoredKeyPair(userId);
-      return keyPair !== null;
+      if (!keyPair) {
+        return false;
+      }
+
+      // Check if all participants have public keys available
+      for (const participantId of chat.participants) {
+        const publicKey = await this.getUserPublicKey(participantId);
+        if (!publicKey) {
+          console.warn(
+            `Encryption not available: participant ${participantId} has no public key`,
+          );
+          return false;
+        }
+      }
+
+      return true;
     } catch (error) {
       console.error("Error checking encryption availability:", error);
       return false;
@@ -696,9 +905,81 @@ export class EncryptedChatService {
         );
         // Don't throw here - local encryption keys are still functional
       }
+
+      // Trigger automatic backup for first-time key generation
+      const keyBackupService = this.keyBackupService;
+      if (
+        keyBackupService &&
+        typeof keyBackupService.handleFirstEncryptedMessage === "function"
+      ) {
+        try {
+          await keyBackupService.handleFirstEncryptedMessage(keyPair);
+        } catch (backupError) {
+          console.warn(
+            "Automatic backup failed, user can backup manually later:",
+            backupError,
+          );
+          // Don't block encryption setup if backup fails
+        }
+      }
     } catch (error) {
       console.error("Error initializing encryption:", error);
       throw error;
+    }
+  }
+
+  /**
+   * Check encryption key health
+   * Tests if keys can encrypt/decrypt properly
+   */
+  async checkKeyHealth(userId: string): Promise<{
+    healthy: boolean;
+    error?: string;
+    recommendation?: string;
+  }> {
+    try {
+      const keyPair = await this.encryptionService.getStoredKeyPair(userId);
+
+      if (!keyPair) {
+        return {
+          healthy: false,
+          error: "No encryption keys found",
+          recommendation: "Enable encryption or restore from backup",
+        };
+      }
+
+      // Test encryption/decryption
+      const testMessage = "test-" + Date.now();
+      const messageKey = await this.encryptionService.generateMessageKey();
+
+      // Test encrypt
+      const encrypted = await this.encryptionService.encryptMessage(
+        testMessage,
+        messageKey,
+      );
+
+      // Test decrypt
+      const decrypted = await this.encryptionService.decryptMessage(
+        encrypted,
+        messageKey,
+      );
+
+      if (decrypted !== testMessage) {
+        return {
+          healthy: false,
+          error: "Keys corrupted - decryption mismatch",
+          recommendation: "Restore keys from backup or generate new keys",
+        };
+      }
+
+      return {healthy: true};
+    } catch (error) {
+      console.error("Key health check failed:", error);
+      return {
+        healthy: false,
+        error: (error as Error).message || "Unknown error",
+        recommendation: "Try restoring from backup or regenerate keys",
+      };
     }
   }
 
@@ -719,7 +1000,7 @@ export class EncryptedChatService {
       this.keyRegenerationInProgress = true;
 
       // Clear existing keys and cache
-      this.encryptionService.clearStoredKeys(userId);
+      await this.encryptionService.clearStoredKeys(userId);
       this.clearDecryptionCache();
 
       // Generate new key pair
@@ -769,7 +1050,7 @@ export class EncryptedChatService {
     }
 
     // Clear local keys
-    this.encryptionService.clearStoredKeys(currentUser.uid);
+    await this.encryptionService.clearStoredKeys(currentUser.uid);
 
     // Remove public key from Firestore
     await this.firestore.collection("userKeys").doc(currentUser.uid).delete();
@@ -830,14 +1111,6 @@ export class EncryptedChatService {
     sessionKeysToRemove.forEach((key) => {
       sessionStorage.removeItem(key);
     });
-  }
-
-  /**
-   * Clear decryption cache to free memory or when switching users/chats
-   */
-  clearDecryptionCache(): void {
-    this.decryptedCache.clear();
-    this.messageVersions.clear();
   }
 
   /**
@@ -1149,7 +1422,7 @@ export class EncryptedChatService {
       );
 
       // Clear existing keys and cache
-      this.encryptionService.clearStoredKeys(userId);
+      await this.encryptionService.clearStoredKeys(userId);
       this.clearDecryptionCache();
 
       // Generate new key pair

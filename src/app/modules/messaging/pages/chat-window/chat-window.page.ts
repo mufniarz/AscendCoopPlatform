@@ -29,14 +29,22 @@ import {
 import {ActivatedRoute, Router} from "@angular/router";
 import {
   IonContent,
+  IonInfiniteScroll,
   ToastController,
   ActionSheetController,
   ModalController,
   AlertController,
   Platform,
 } from "@ionic/angular";
-import {Observable, Subject, of, firstValueFrom} from "rxjs";
-import {takeUntil, map, take} from "rxjs/operators";
+import {
+  Observable,
+  Subject,
+  of,
+  firstValueFrom,
+  Subscription,
+  combineLatest,
+} from "rxjs";
+import {takeUntil, map, take, tap, switchMap, finalize} from "rxjs/operators";
 import {
   Chat,
   Message,
@@ -48,6 +56,8 @@ import {ChatService} from "../../services/chat.service";
 import {RelationshipService} from "../../services/relationship.service";
 import {NotificationService} from "../../services/notification.service";
 import {EncryptedChatService} from "../../services/encrypted-chat.service";
+import {EncryptionService} from "../../services/encryption.service";
+import {KeyBackupService} from "../../services/key-backup.service";
 import {NetworkConnectionService} from "../../../../core/services/network-connection.service";
 import {OfflineSyncService} from "../../../../core/services/offline-sync.service";
 import {Store} from "@ngrx/store";
@@ -57,6 +67,7 @@ import {selectAccountById} from "../../../../state/selectors/account.selectors";
 import * as AccountActions from "../../../../state/actions/account.actions";
 import {UserReportModalComponent} from "../../components/user-report-modal/user-report-modal.component";
 import {ChatParticipantsModalComponent} from "../../components/chat-participants-modal/chat-participants-modal.component";
+import {KeyRestoreModalComponent} from "../../components/key-restore-modal/key-restore-modal.component";
 
 @Component({
   selector: "app-chat-window",
@@ -65,6 +76,9 @@ import {ChatParticipantsModalComponent} from "../../components/chat-participants
 })
 export class ChatWindowPage implements OnInit, OnDestroy {
   @ViewChild(IonContent, {static: false}) content!: IonContent;
+  @ViewChild(IonInfiniteScroll) infiniteScroll!: IonInfiniteScroll;
+  private destroy$ = new Subject<void>();
+  private messagesDestroy$ = new Subject<void>(); // For canceling message subscriptions
   @ViewChild("messageInput", {static: false}) messageInput!: ElementRef;
 
   chatId!: string;
@@ -78,18 +92,28 @@ export class ChatWindowPage implements OnInit, OnDestroy {
   isContactBlocked = false;
   isDesktop = false;
 
+  // Infinite Scroll properties
+  readonly MESSAGE_LIMIT = 10;
+  lastMessageTimestamp: any = null;
+  isEverythingLoaded = false;
+  isHistoryLoading = false;
+  isMessagesLoading = true; // Track initial message load
+  private initialLoadComplete = false;
+
   // File preview properties
   selectedFile: File | null = null;
   filePreviewUrl: string | null = null;
   filePreviewType: "image" | "video" | "audio" | "document" | null = null;
   isUploadingFile = false;
   canSendMessages = true;
-  private destroy$ = new Subject<void>();
+  // private destroy$ = new Subject<void>(); // Moved this declaration up
 
   // Encryption properties
   encryptionEnabled = false;
   isEncryptionActive = false;
   encryptionAvailable = false;
+  hasEncryptionBackup = false;
+  showBackupWarning = false;
 
   // Connection status properties
   isOnline$!: Observable<boolean>;
@@ -109,6 +133,8 @@ export class ChatWindowPage implements OnInit, OnDestroy {
     private cdr: ChangeDetectorRef,
     private ngZone: NgZone,
     private encryptedChatService: EncryptedChatService,
+    private encryptionService: EncryptionService,
+    private keyBackupService: KeyBackupService,
     private networkService: NetworkConnectionService,
     private offlineSync: OfflineSyncService,
     private platform: Platform,
@@ -151,6 +177,11 @@ export class ChatWindowPage implements OnInit, OnDestroy {
     // Mark notifications as read for this chat when entering
     this.notificationService.markChatNotificationsAsRead(this.chatId);
 
+    // Reset unread count for this user in the chat document
+    this.chatService.markChatAsRead(this.chatId).subscribe({
+      error: (error) => console.error("Error marking chat as read:", error),
+    });
+
     // Load chat first to validate access
     this.chat$ = this.chatService.getChat(this.chatId);
 
@@ -166,17 +197,64 @@ export class ChatWindowPage implements OnInit, OnDestroy {
       },
       error: (error) => {
         console.error("Error loading chat:", error);
-        this.showErrorToast("Error loading chat");
-        this.router.navigate(["/messaging/chats"]);
+        // Only navigate away if it's NOT a permission error (which happens on logout)
+        if (
+          error.code !== "permission-denied" &&
+          error.message !== "Missing or insufficient permissions."
+        ) {
+          this.showErrorToast("Error loading chat");
+          this.router.navigate(["/messaging/chats"]);
+        }
       },
     });
 
     // Load messages with decryption support
     this.loadMessages();
+
+    // Subscribe to encryption key changes to re-decrypt messages
+    this.encryptionService.keysChanged$
+      .pipe(takeUntil(this.destroy$))
+      .subscribe(
+        ({
+          userId,
+          action,
+        }: {
+          userId: string;
+          action: "restored" | "cleared";
+        }) => {
+          console.log(
+            `Key change event received: ${action} for user ${userId}`,
+          );
+          console.log(
+            `Current user: ${this.currentUserId}, Encryption enabled: ${this.encryptionEnabled}`,
+          );
+
+          // Reload if it's the current user's keys (check encryption status after restoring keys)
+          if (userId === this.currentUserId) {
+            console.log(
+              `Encryption keys ${action} for current user, reloading messages...`,
+            );
+
+            // Cancel previous message subscription
+            this.messagesDestroy$.next();
+
+            // Clear current messages to force fresh load
+            this.messages = [];
+
+            // Re-check encryption status and reload
+            this.initializeEncryption().then(() => {
+              console.log(
+                `After re-init: Encryption enabled: ${this.encryptionEnabled}`,
+              );
+            });
+          }
+        },
+      );
   }
 
   /**
    * Load messages with encryption support
+   * This subscribes to real-time updates for the recent messages (Head)
    */
   private loadMessages() {
     if (!this.currentUserId) {
@@ -184,31 +262,178 @@ export class ChatWindowPage implements OnInit, OnDestroy {
     }
 
     // Use encrypted chat service if encryption is enabled, otherwise use regular service
+    let messagesSource$: Observable<Message[]>;
+
+    // Always fetch just the latest batch for the real-time listener
+    // History will be loaded via loadMoreMessages
+    const limit = this.MESSAGE_LIMIT;
+
     if (this.encryptionEnabled) {
-      this.messages$ = this.encryptedChatService.getDecryptedMessages(
+      messagesSource$ = this.encryptedChatService.getDecryptedMessages(
         this.chatId,
         this.currentUserId,
+        limit,
       );
     } else {
-      this.messages$ = this.chatService.getChatMessages(this.chatId);
+      messagesSource$ = this.chatService.getChatMessages(this.chatId, limit);
     }
 
     // Subscribe to messages and update local array
-    this.messages$.pipe(takeUntil(this.destroy$)).subscribe({
-      next: (messages) => {
-        // Merge server messages with local optimistic messages
-        this.messages = this.mergeMessages(messages);
+    console.log(`Loading messages with encryption: ${this.encryptionEnabled}`);
+    messagesSource$
+      .pipe(takeUntil(this.messagesDestroy$), takeUntil(this.destroy$))
+      .subscribe({
+        next: (messages) => {
+          // Merge server messages with local optimistic messages and historical messages
+          this.messages = this.mergeMessages(messages);
 
-        // Pre-load sender accounts for avatar display
-        this.preloadSenderAccounts(messages);
+          // Pre-load sender accounts for avatar display
+          this.preloadSenderAccounts(messages);
 
-        setTimeout(() => this.scrollToBottom(), 100);
+          // Determine scroll behavior
+          // 1. If it's the initial load sequence (which might include decryption updates), stick to bottom.
+          // 2. If the user was already at the bottom, stay at the bottom (new message or expansion).
+          // 3. If it's a completely new incoming message, scroll to it.
+
+          const isAtBottom = this.isUserAtBottom();
+          const isInitialLoadSequence = !this.initialLoadComplete;
+
+          // Mark initial load complete after first valid render (with a delay to allow for decryption/rendering)
+          // We use a property to track if we've ever successfully settled at the bottom
+          if (!this.lastMessageTimestamp && this.messages.length > 0) {
+            // First time we have messages
+            // Don't set initialLoadComplete immediately, wait for stability
+            setTimeout(() => {
+              this.initialLoadComplete = true;
+            }, 2000); // Give it 2 seconds of "stickiness" for initial load
+          }
+
+          const shouldScroll =
+            isInitialLoadSequence ||
+            isAtBottom ||
+            this.isNewMessageReceived(messages);
+
+          // Update timestamp marker for history loading
+          if (this.messages.length > 0) {
+            // The oldest message in the current list
+            // Note: messages are sorted [oldest, ..., newest]
+            const oldestMessage = this.messages[0];
+            this.lastMessageTimestamp = oldestMessage.timestamp;
+          }
+
+          // Hide loading skeleton immediately on first emission
+          // Use requestAnimationFrame to ensure DOM is ready
+          if (this.isMessagesLoading) {
+            requestAnimationFrame(() => {
+              this.isMessagesLoading = false;
+              // Trigger change detection and scroll after DOM update
+              requestAnimationFrame(() => {
+                if (shouldScroll) {
+                  this.scrollToBottom();
+                  setTimeout(() => this.scrollToBottom(), 100);
+                  setTimeout(() => this.scrollToBottom(), 300);
+                }
+              });
+            });
+          } else if (shouldScroll) {
+            // Normal scroll behavior for subsequent updates
+            this.scrollToBottom();
+            setTimeout(() => this.scrollToBottom(), 100);
+            setTimeout(() => this.scrollToBottom(), 300);
+          }
+        },
+        error: (error) => {
+          console.error("Error loading messages:", error);
+          this.showErrorToast("Error loading messages");
+        },
+      });
+  }
+
+  /**
+   * Load more messages (History) when scrolling up
+   */
+  loadMoreMessages(event: any) {
+    if (this.isEverythingLoaded || this.isHistoryLoading) {
+      event.target.complete();
+      return;
+    }
+
+    this.isHistoryLoading = true;
+
+    // Use the oldest message timestamp as the cursor
+    const oldestMessage = this.messages[0];
+    if (!oldestMessage || !oldestMessage.timestamp) {
+      event.target.complete();
+      this.isHistoryLoading = false;
+      return;
+    }
+
+    const cursor = oldestMessage.timestamp;
+
+    // Fetch history
+    let history$: Observable<Message[]>;
+
+    if (this.encryptionEnabled && this.currentUserId) {
+      history$ = this.encryptedChatService.getDecryptedHistory(
+        this.chatId,
+        cursor,
+        this.MESSAGE_LIMIT,
+        this.currentUserId,
+      );
+    } else {
+      history$ = this.chatService.getChatHistory(
+        this.chatId,
+        cursor,
+        this.MESSAGE_LIMIT,
+      );
+    }
+
+    history$.pipe(take(1)).subscribe({
+      next: (historicalMessages) => {
+        if (historicalMessages.length < this.MESSAGE_LIMIT) {
+          this.isEverythingLoaded = true;
+          if (this.infiniteScroll) {
+            this.infiniteScroll.disabled = true;
+          }
+        }
+
+        if (historicalMessages.length > 0) {
+          // Prepend historical messages to the current list
+          // Merge to avoid duplicates
+          const newMessages = this.mergeHistory(
+            historicalMessages,
+            this.messages,
+          );
+          this.messages = newMessages;
+
+          // Preload avatars for new messages
+          this.preloadSenderAccounts(historicalMessages);
+
+          // Restore scroll position (approximated)
+          // Ideally we would calculate height diff, but for now we just let Ionic handle it
+          // or the user stays where they are relative to the content
+        }
+
+        event.target.complete();
+        this.isHistoryLoading = false;
       },
       error: (error) => {
-        console.error("Error loading messages:", error);
-        this.showErrorToast("Error loading messages");
+        console.error("Error loading chat history:", error);
+        event.target.complete();
+        this.isHistoryLoading = false;
       },
     });
+  }
+
+  /**
+   * Merge historical messages with current messages
+   */
+  private mergeHistory(history: Message[], current: Message[]): Message[] {
+    const currentIds = new Set(current.map((m) => m.id));
+    const uniqueHistory = history.filter((m) => !currentIds.has(m.id));
+    // History comes oldest -> newest. Current is oldest -> newest.
+    // So we want [History, Current]
+    return [...uniqueHistory, ...current];
   }
 
   /**
@@ -304,11 +529,101 @@ export class ChatWindowPage implements OnInit, OnDestroy {
         }
       }
 
+      // Check if backup exists but local keys are missing (new device scenario)
+      if (this.encryptionEnabled) {
+        // Check backup status
+        const backupStatus = await this.keyBackupService.hasBackup();
+        this.hasEncryptionBackup = backupStatus.hasBackup;
+
+        const hasLocalKeys = await this.encryptionService.getStoredKeyPair(
+          this.currentUserId,
+        );
+
+        // Show warning if keys exist but no backup
+        this.showBackupWarning = !!hasLocalKeys && !backupStatus.hasBackup;
+
+        if (!hasLocalKeys) {
+          if (backupStatus.hasBackup) {
+            // Show restore prompt automatically
+            await this.promptKeyRestore(backupStatus.authMethod || "password");
+          }
+        }
+      }
+
       // Reload messages with encryption support if encryption status changed
       this.loadMessages();
     } catch (error) {
       console.error("Error initializing encryption:", error);
     }
+  }
+
+  /**
+   * Prompt user to restore keys from backup (new device scenario)
+   */
+  private async promptKeyRestore(
+    authMethod: "password" | "sso",
+  ): Promise<void> {
+    try {
+      const modal = await this.modalController.create({
+        component: KeyRestoreModalComponent,
+        componentProps: {
+          authMethod: authMethod,
+        },
+        backdropDismiss: false, // Require user decision
+      });
+
+      await modal.present();
+
+      const {data, role} = await modal.onDidDismiss();
+
+      if (role === "restore" && data) {
+        // Keys restored successfully via the modal
+        const authUser = await firstValueFrom(
+          this.store.select(selectAuthUser),
+        );
+        if (authUser?.uid) {
+          await this.encryptionService.storeKeyPair(data, authUser.uid);
+          await this.showSuccessToast(
+            "Keys restored successfully! Your encrypted messages are now accessible.",
+          );
+          // Messages will auto-reload due to keysChanged$ subscription
+        }
+      } else if (role === "skip") {
+        // User chose to generate new keys
+        await this.showInfoToast(
+          "New keys generated. Previous encrypted messages may not be accessible.",
+        );
+      }
+    } catch (error) {
+      console.error("Error in key restore prompt:", error);
+    }
+  }
+
+  /**
+   * Prompt user when some participants don't have encryption keys
+   */
+  private async promptPartialEncryption(
+    missingCount: number,
+  ): Promise<boolean> {
+    return new Promise(async (resolve) => {
+      const alert = await this.alertController.create({
+        header: "⚠️ Partial Encryption",
+        message: `${missingCount} ${missingCount === 1 ? "participant has" : "participants have"} not enabled encryption yet. Your message cannot be encrypted for them.`,
+        buttons: [
+          {
+            text: "Cancel",
+            role: "cancel",
+            handler: () => resolve(false),
+          },
+          {
+            text: "Send Unencrypted",
+            handler: () => resolve(true),
+          },
+        ],
+      });
+
+      await alert.present();
+    });
   }
 
   /**
@@ -324,8 +639,7 @@ export class ChatWindowPage implements OnInit, OnDestroy {
   private async validateChatAccess(chat: Chat) {
     try {
       if (!this.currentUserId) {
-        this.showErrorToast("Authentication required");
-        this.router.navigate(["/messaging/chats"]);
+        // User logged out, just return
         return;
       }
 
@@ -380,10 +694,16 @@ export class ChatWindowPage implements OnInit, OnDestroy {
           return;
         }
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error validating chat access:", error);
-      this.showErrorToast("Error validating chat access");
-      this.router.navigate(["/messaging/chats"]);
+      // Only navigate away if it's NOT a permission error (which happens on logout)
+      if (
+        error?.code !== "permission-denied" &&
+        error?.message !== "Missing or insufficient permissions."
+      ) {
+        this.showErrorToast("Error validating chat access");
+        this.router.navigate(["/messaging/chats"]);
+      }
     }
   }
 
@@ -397,6 +717,8 @@ export class ChatWindowPage implements OnInit, OnDestroy {
   }
 
   ngOnDestroy() {
+    this.messagesDestroy$.next();
+    this.messagesDestroy$.complete();
     this.destroy$.next();
     this.destroy$.complete();
     // Clear caches outside Angular zone to prevent signal conflicts
@@ -468,8 +790,40 @@ export class ChatWindowPage implements OnInit, OnDestroy {
           ? {...msg, id: messageId || msg.id, status: MessageStatus.SENT}
           : msg,
       );
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error sending message:", error);
+
+      // Handle partial encryption scenario
+      if (error.message === "PARTIAL_ENCRYPTION_AVAILABLE") {
+        // Remove optimistic message
+        this.messages = this.messages.filter(
+          (msg) => msg.id !== optimisticMessage.id,
+        );
+
+        // Prompt user for decision
+        const shouldSendUnencrypted = await this.promptPartialEncryption(
+          error.missingKeyParticipants?.length || 0,
+        );
+
+        if (shouldSendUnencrypted) {
+          // Resend as unencrypted
+          try {
+            const unencryptedRequest = {...request, isEncrypted: false};
+            const messageId = await firstValueFrom(
+              this.chatService.sendMessage(unencryptedRequest),
+            );
+            await this.showInfoToast("Message sent unencrypted");
+          } catch (retryError) {
+            console.error("Failed to send unencrypted message:", retryError);
+            this.showErrorToast("Failed to send message");
+          }
+        } else {
+          // User cancelled - restore original text to input
+          this.newMessage = messageText;
+        }
+        return;
+      }
+
       this.showErrorToast("Failed to send message");
 
       // Update optimistic message status to failed
@@ -698,6 +1052,13 @@ export class ChatWindowPage implements OnInit, OnDestroy {
           this.showNotificationSettings();
         },
       },
+      {
+        text: "Encryption Settings",
+        icon: "lock-closed-outline",
+        handler: () => {
+          this.showEncryptionSettings();
+        },
+      },
     ];
 
     // Add manage participants option for group chats
@@ -744,6 +1105,16 @@ export class ChatWindowPage implements OnInit, OnDestroy {
         });
       }
     }
+
+    // Add delete chat option (always shown)
+    buttons.push({
+      text: "Delete Chat",
+      icon: "trash-outline",
+      role: "destructive",
+      handler: () => {
+        this.deleteChat();
+      },
+    });
 
     buttons.push({
       text: "Cancel",
@@ -990,6 +1361,19 @@ export class ChatWindowPage implements OnInit, OnDestroy {
       message,
       duration: 2000,
       color: "success",
+      position: "top",
+    });
+    await toast.present();
+  }
+
+  /**
+   * Show info toast message
+   */
+  private async showInfoToast(message: string) {
+    const toast = await this.toastController.create({
+      message,
+      duration: 3000,
+      color: "primary",
       position: "top",
     });
     await toast.present();
@@ -1396,6 +1780,10 @@ export class ChatWindowPage implements OnInit, OnDestroy {
           role: "destructive",
           handler: async () => {
             try {
+              // Optimistically remove message from local array
+              this.messages = this.messages.filter((m) => m.id !== message.id);
+
+              // Delete from Firestore
               await firstValueFrom(
                 this.chatService.deleteMessage(this.chatId!, message.id),
               );
@@ -1403,6 +1791,42 @@ export class ChatWindowPage implements OnInit, OnDestroy {
             } catch (error) {
               console.error("Error deleting message:", error);
               this.showErrorToast("Failed to delete message");
+              // Reload messages on error to restore the message
+              // The subscription will pick up the current state
+            }
+          },
+        },
+      ],
+    });
+
+    await alert.present();
+  }
+
+  /**
+   * Delete entire chat conversation
+   */
+  private async deleteChat() {
+    const alert = await this.alertController.create({
+      header: "Delete Chat",
+      message:
+        "Are you sure you want to delete this entire chat? This will remove it from your chat list. This action cannot be undone.",
+      buttons: [
+        {
+          text: "Cancel",
+          role: "cancel",
+        },
+        {
+          text: "Delete",
+          role: "destructive",
+          handler: async () => {
+            try {
+              await firstValueFrom(this.chatService.deleteChat(this.chatId!));
+              this.showToast("Chat deleted successfully", "short");
+              // Navigate back to chat list
+              this.router.navigate(["/messaging/chats"]);
+            } catch (error) {
+              console.error("Error deleting chat:", error);
+              this.showErrorToast("Failed to delete chat");
             }
           },
         },
@@ -1563,6 +1987,27 @@ export class ChatWindowPage implements OnInit, OnDestroy {
   }
 
   /**
+   * Show encryption settings modal
+   */
+  async showEncryptionSettings() {
+    try {
+      const {EncryptionSettingsComponent} = await import(
+        "../../components/encryption-settings/encryption-settings.component"
+      );
+
+      const modal = await this.modalController.create({
+        component: EncryptionSettingsComponent,
+        cssClass: "encryption-settings-modal",
+      });
+
+      await modal.present();
+    } catch (error) {
+      console.error("Error opening encryption settings:", error);
+      this.showErrorToast("Failed to open encryption settings");
+    }
+  }
+
+  /**
    * Show toast message
    */
   private async showToast(
@@ -1586,5 +2031,94 @@ export class ChatWindowPage implements OnInit, OnDestroy {
     if (target) {
       target.src = "assets/image/logo/ASCENDynamics NFP-logos_transparent.png";
     }
+  }
+  /**
+   * Check if a new message has been received at the bottom of the list
+   */
+  private isNewMessageReceived(newMessages: Message[]): boolean {
+    if (newMessages.length === 0) return false;
+
+    // If local list is empty, it's new
+    if (this.messages.length === 0) return true;
+
+    // Check if the last message in the new batch is different from the last message we had
+    const lastNewMessage = newMessages[newMessages.length - 1];
+    const lastLocalMessage = this.messages[this.messages.length - 1];
+
+    if (!lastNewMessage || !lastLocalMessage) return true;
+
+    return lastNewMessage.id !== lastLocalMessage.id;
+  }
+
+  /**
+   * Check if a message is from a different day than the previous message
+   * Used to show date separators in chat
+   */
+  shouldShowDateSeparator(currentIndex: number): boolean {
+    if (currentIndex === 0) return true; // Always show for first message
+
+    const currentMessage = this.messages[currentIndex];
+    const previousMessage = this.messages[currentIndex - 1];
+
+    if (!currentMessage?.timestamp || !previousMessage?.timestamp) return false;
+
+    const currentDate = this.getMessageDate(currentMessage.timestamp);
+    const previousDate = this.getMessageDate(previousMessage.timestamp);
+
+    return currentDate.toDateString() !== previousDate.toDateString();
+  }
+
+  /**
+   * Get formatted date label for a message (e.g., "Today", "Yesterday", or the date)
+   */
+  getDateLabel(message: Message): string {
+    if (!message?.timestamp) return "";
+
+    const messageDate = this.getMessageDate(message.timestamp);
+    const today = new Date();
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+
+    // Reset time parts for accurate date comparison
+    today.setHours(0, 0, 0, 0);
+    yesterday.setHours(0, 0, 0, 0);
+    messageDate.setHours(0, 0, 0, 0);
+
+    if (messageDate.getTime() === today.getTime()) {
+      return "Today";
+    } else if (messageDate.getTime() === yesterday.getTime()) {
+      return "Yesterday";
+    } else {
+      // Format as "Mon, Jan 15, 2025"
+      return messageDate.toLocaleDateString("en-US", {
+        weekday: "short",
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+      });
+    }
+  }
+
+  /**
+   * Convert Firestore timestamp to Date
+   */
+  private getMessageDate(timestamp: any): Date {
+    if (timestamp?.toDate) {
+      return timestamp.toDate();
+    }
+    return new Date(timestamp);
+  }
+
+  /**
+   * Check if user is scrolled near the bottom
+   */
+  private isUserAtBottom(): boolean {
+    if (!this.content) return true; // Default to true if content not ready
+
+    // We can't synchronously check scroll position easily in Ionic without getting the scroll element
+    // So we assume true for now if we haven't tracked it, OR we could track it on scroll events.
+    // For simplicity, let's rely on the sticky logic: we assume if we just sent a message or it's new, we want to scroll.
+    // To properly implement "don't scroll if user is reading history", we need to track scroll events.
+    return true;
   }
 }

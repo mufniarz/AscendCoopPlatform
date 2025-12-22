@@ -18,6 +18,8 @@
 * along with Nonprofit Social Networking Platform.  If not, see <https://www.gnu.org/licenses/>.
 ***********************************************************************************************/
 import {Injectable} from "@angular/core";
+import {Subject, Observable} from "rxjs";
+import {SecureKeyStorageService} from "./secure-key-storage.service";
 
 export interface KeyPair {
   publicKey: CryptoKey;
@@ -39,7 +41,17 @@ export class EncryptionService {
   private readonly KEY_LENGTH = 256;
   private readonly IV_LENGTH = 12; // 96 bits for AES-GCM
 
-  constructor() {}
+  // Observable for key changes (when keys are restored or cleared)
+  private keysChangedSubject = new Subject<{
+    userId: string;
+    action: "restored" | "cleared";
+  }>();
+  public keysChanged$: Observable<{
+    userId: string;
+    action: "restored" | "cleared";
+  }> = this.keysChangedSubject.asObservable();
+
+  constructor(private secureKeyStorage: SecureKeyStorageService) {}
 
   /**
    * Generate a new AES key for encrypting messages
@@ -246,23 +258,71 @@ export class EncryptionService {
   }
 
   /**
-   * Store keys securely in browser
+   * Get public key fingerprint for display/verification
+   * Returns a human-readable fingerprint in format: XXXX XXXX XXXX XXXX
+   */
+  async getPublicKeyFingerprint(publicKey: CryptoKey): Promise<string> {
+    try {
+      // Export public key
+      const publicKeyBytes = await crypto.subtle.exportKey("spki", publicKey);
+      // Create SHA-256 hash
+      const hashBytes = await crypto.subtle.digest("SHA-256", publicKeyBytes);
+      // Convert to hex string
+      const hashArray = Array.from(new Uint8Array(hashBytes));
+      const hexString = hashArray
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      // Take first 16 characters and format as XXXX XXXX XXXX XXXX
+      const formatted = hexString
+        .substring(0, 16)
+        .toUpperCase()
+        .match(/.{1,4}/g)
+        ?.join(" ");
+      return formatted || hexString.substring(0, 16).toUpperCase();
+    } catch (error) {
+      console.error("Error generating fingerprint:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get public key fingerprint from stored keys for current user
+   */
+  async getStoredPublicKeyFingerprint(userId: string): Promise<string | null> {
+    try {
+      const keyPair = await this.getStoredKeyPair(userId);
+      if (!keyPair) {
+        return null;
+      }
+      return await this.getPublicKeyFingerprint(keyPair.publicKey);
+    } catch (error) {
+      console.error("Error getting stored key fingerprint:", error);
+      return null;
+    }
+  }
+
+  /**
+   * Store keys securely in browser using IndexedDB
+   * Migrated from localStorage to IndexedDB for better XSS protection
    */
   async storeKeyPair(keyPair: KeyPair, userId: string): Promise<void> {
     try {
-      // Export keys
-      const publicKeyString = await this.exportPublicKey(keyPair.publicKey);
-      const privateKeyBytes = await crypto.subtle.exportKey(
-        "pkcs8",
+      // Store in IndexedDB with encryption
+      await this.secureKeyStorage.storeKeyPair(
+        userId,
+        keyPair.publicKey,
         keyPair.privateKey,
       );
-      const privateKeyString = btoa(
-        String.fromCharCode(...new Uint8Array(privateKeyBytes)),
+
+      console.log(
+        `[EncryptionService] Keys stored securely for user ${userId}`,
       );
 
-      // Store in localStorage (in production, consider more secure storage)
-      localStorage.setItem(`publicKey_${userId}`, publicKeyString);
-      localStorage.setItem(`privateKey_${userId}`, privateKeyString);
+      // Notify that keys have been restored
+      this.keysChangedSubject.next({userId, action: "restored"});
+      console.log(
+        `[EncryptionService] Emitted 'restored' event for user ${userId}`,
+      );
     } catch (error) {
       console.error("Error storing key pair:", error);
       throw error;
@@ -270,85 +330,35 @@ export class EncryptionService {
   }
 
   /**
-   * Get stored key pair for a user, with enhanced error handling and corruption detection
+   * Get stored key pair for a user from IndexedDB
+   * Automatically migrates from localStorage if keys exist there
    */
   async getStoredKeyPair(userId: string): Promise<CryptoKeyPair | null> {
     try {
-      // Check both old and new naming conventions for backward compatibility
-      let publicKeyData = localStorage.getItem(`publicKey_${userId}`);
-      let privateKeyData = localStorage.getItem(`privateKey_${userId}`);
+      // Try to get keys from IndexedDB first
+      let keyPair = await this.secureKeyStorage.getKeyPair(userId);
 
-      // Fallback to old naming convention if new one doesn't exist
-      if (!publicKeyData || !privateKeyData) {
-        publicKeyData = localStorage.getItem(`encryptionPublicKey_${userId}`);
-        privateKeyData = localStorage.getItem(`encryptionPrivateKey_${userId}`);
-
-        // If we found keys with old naming, migrate them to new naming
-        if (publicKeyData && privateKeyData) {
-          console.log(
-            `Migrating keys from old naming convention for user ${userId}`,
-          );
-          localStorage.setItem(`publicKey_${userId}`, publicKeyData);
-          localStorage.setItem(`privateKey_${userId}`, privateKeyData);
-          // Remove old keys
-          localStorage.removeItem(`encryptionPublicKey_${userId}`);
-          localStorage.removeItem(`encryptionPrivateKey_${userId}`);
-        }
+      if (keyPair) {
+        return keyPair;
       }
 
-      if (!publicKeyData || !privateKeyData) {
-        return null;
+      // If not found in IndexedDB, try migrating from localStorage
+      console.log(
+        `[EncryptionService] Attempting to migrate keys from localStorage for user ${userId}`,
+      );
+      const migrated =
+        await this.secureKeyStorage.migrateFromLocalStorage(userId);
+
+      if (migrated) {
+        console.log(
+          `[EncryptionService] Successfully migrated keys for user ${userId}`,
+        );
+        // Get the newly migrated keys
+        keyPair = await this.secureKeyStorage.getKeyPair(userId);
+        return keyPair;
       }
 
-      // Import each key separately with individual error handling
-      let publicKey: CryptoKey;
-      let privateKey: CryptoKey;
-
-      try {
-        // Import public key
-        const publicKeyBuffer = Uint8Array.from(atob(publicKeyData), (c) =>
-          c.charCodeAt(0),
-        );
-        publicKey = await window.crypto.subtle.importKey(
-          "spki",
-          publicKeyBuffer,
-          {
-            name: "RSA-OAEP",
-            hash: "SHA-256",
-          },
-          true,
-          ["encrypt"],
-        );
-      } catch (publicKeyError) {
-        console.error("Failed to import public key:", publicKeyError);
-        // Clear corrupted keys and return null
-        await this.clearStoredKeys(userId);
-        return null;
-      }
-
-      try {
-        // Import private key
-        const privateKeyBuffer = Uint8Array.from(atob(privateKeyData), (c) =>
-          c.charCodeAt(0),
-        );
-        privateKey = await window.crypto.subtle.importKey(
-          "pkcs8",
-          privateKeyBuffer,
-          {
-            name: "RSA-OAEP",
-            hash: "SHA-256",
-          },
-          true,
-          ["decrypt"],
-        );
-      } catch (privateKeyError) {
-        console.error("Failed to import private key:", privateKeyError);
-        // Clear corrupted keys and return null
-        await this.clearStoredKeys(userId);
-        return null;
-      }
-
-      return {publicKey, privateKey};
+      return null;
     } catch (error) {
       console.error("Error retrieving stored keys:", error);
       // Clear potentially corrupted keys
@@ -358,15 +368,139 @@ export class EncryptionService {
   }
 
   /**
-   * Clear stored keys (for logout) - clears both old and new naming conventions
+   * Derive encryption key from password using PBKDF2
+   * @param password - User's password or passphrase
+   * @param salt - Salt for key derivation (32 bytes)
+   * @param iterations - Number of PBKDF2 iterations (recommended: 100,000)
+   * @returns AES-256 key for encryption/decryption
    */
-  clearStoredKeys(userId: string): void {
-    // Clear new naming convention
-    localStorage.removeItem(`publicKey_${userId}`);
-    localStorage.removeItem(`privateKey_${userId}`);
+  async deriveKeyFromPassword(
+    password: string,
+    salt: Uint8Array,
+    iterations: number,
+  ): Promise<CryptoKey> {
+    // Convert password to key material
+    const passwordBuffer = new TextEncoder().encode(password);
+    const keyMaterial = await crypto.subtle.importKey(
+      "raw",
+      passwordBuffer,
+      "PBKDF2",
+      false,
+      ["deriveBits", "deriveKey"],
+    );
 
-    // Clear old naming convention for backward compatibility
-    localStorage.removeItem(`encryptionPublicKey_${userId}`);
-    localStorage.removeItem(`encryptionPrivateKey_${userId}`);
+    // Derive AES-GCM key
+    return await crypto.subtle.deriveKey(
+      {
+        name: "PBKDF2",
+        salt: salt as BufferSource,
+        iterations: iterations,
+        hash: "SHA-256",
+      },
+      keyMaterial,
+      {
+        name: "AES-GCM",
+        length: 256,
+      },
+      false, // not extractable
+      ["encrypt", "decrypt"],
+    );
+  }
+
+  /**
+   * Clear stored keys (for logout) - clears from both IndexedDB and localStorage
+   */
+  async clearStoredKeys(userId: string): Promise<void> {
+    try {
+      // Clear from IndexedDB
+      await this.secureKeyStorage.clearKeys(userId);
+
+      // Also clear from localStorage (for backward compatibility during migration period)
+      localStorage.removeItem(`publicKey_${userId}`);
+      localStorage.removeItem(`privateKey_${userId}`);
+      localStorage.removeItem(`encryptionPublicKey_${userId}`);
+      localStorage.removeItem(`encryptionPrivateKey_${userId}`);
+
+      // Only notify that keys have been cleared after successful operation
+      this.keysChangedSubject.next({userId, action: "cleared"});
+    } catch (error) {
+      console.error("Error clearing keys:", error);
+      // Re-throw to allow caller to handle the error
+      throw error;
+    }
+  }
+
+  /**
+   * Encrypt data with derived key using AES-GCM
+   * @param data - Data to encrypt (as string)
+   * @param key - Derived encryption key from PBKDF2
+   * @returns Encrypted data and IV
+   */
+  async encryptWithDerivedKey(
+    data: string,
+    key: CryptoKey,
+  ): Promise<{encryptedData: string; iv: string}> {
+    // Generate random IV (12 bytes for AES-GCM)
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+
+    // Convert data to bytes
+    const dataBytes = new TextEncoder().encode(data);
+
+    // Encrypt
+    const encryptedBytes = await crypto.subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv: iv,
+      },
+      key,
+      dataBytes,
+    );
+
+    // Convert to base64
+    const encryptedData = btoa(
+      String.fromCharCode(...new Uint8Array(encryptedBytes)),
+    );
+    const ivString = btoa(String.fromCharCode(...iv));
+
+    return {encryptedData, iv: ivString};
+  }
+
+  /**
+   * Decrypt data with derived key using AES-GCM
+   * @param encryptedData - Base64-encoded encrypted data
+   * @param key - Derived encryption key from PBKDF2
+   * @param ivString - Base64-encoded IV
+   * @returns Decrypted data as string
+   */
+  async decryptWithDerivedKey(
+    encryptedData: string,
+    key: CryptoKey,
+    ivString: string,
+  ): Promise<string> {
+    try {
+      // Convert from base64
+      const encryptedBytes = Uint8Array.from(atob(encryptedData), (c) =>
+        c.charCodeAt(0),
+      );
+      const iv = Uint8Array.from(atob(ivString), (c) => c.charCodeAt(0));
+
+      // Decrypt
+      const decryptedBytes = await crypto.subtle.decrypt(
+        {
+          name: "AES-GCM",
+          iv: iv,
+        },
+        key,
+        encryptedBytes,
+      );
+
+      // Convert back to string
+      return new TextDecoder().decode(decryptedBytes);
+    } catch (error) {
+      console.error("Failed to decrypt with derived key:", error);
+      throw new Error(
+        "Decryption failed. Password/passphrase may be incorrect.",
+      );
+    }
   }
 }
